@@ -1,6 +1,21 @@
 name: Build Docker Image
 
 on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "*.md"
+      - "LICENSE"
+
+  pull_request:
+    branches:
+      - main
+
+  release:
+    types:
+      - published
+
   workflow_dispatch:
 
 permissions:
@@ -57,3 +72,4 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.warp }}
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
