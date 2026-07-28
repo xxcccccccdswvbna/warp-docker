@@ -1,79 +1,89 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# exit when any command fails
-set -e
+set -Eeuo pipefail
 
-# create a tun device if not exist
-# allow passing device to ensure compatibility with Podman
-if [ ! -e /dev/net/tun ]; then
+echo "========== Cloudflare WARP =========="
+
+# Create TUN device if missing
+if [ ! -c /dev/net/tun ]; then
+    echo "[INIT] Creating /dev/net/tun..."
     sudo mkdir -p /dev/net
-    sudo mknod /dev/net/tun c 10 200
+    sudo mknod /dev/net/tun c 10 200 || true
     sudo chmod 600 /dev/net/tun
 fi
 
-# start dbus
+# Start DBus
+echo "[INIT] Starting DBus..."
 sudo mkdir -p /run/dbus
-if [ -f /run/dbus/pid ]; then
-    sudo rm /run/dbus/pid
-fi
-sudo dbus-daemon --config-file=/usr/share/dbus-1/system.conf
+sudo rm -f /run/dbus/pid
 
-# start the daemon
+if ! pgrep dbus-daemon >/dev/null 2>&1; then
+    sudo dbus-daemon --system
+fi
+
+# Start Cloudflare WARP service
+echo "[INIT] Starting warp-svc..."
 sudo warp-svc --accept-tos &
 
-# sleep to wait for the daemon to start, default 2 seconds
-sleep "$WARP_SLEEP"
+sleep "${WARP_SLEEP:-2}"
 
-# if /var/lib/cloudflare-warp/reg.json not exists, setup new warp client
+# Register if necessary
 if [ ! -f /var/lib/cloudflare-warp/reg.json ]; then
-    # if /var/lib/cloudflare-warp/mdm.xml not exists or REGISTER_WHEN_MDM_EXISTS not empty, register the warp client
-    if [ ! -f /var/lib/cloudflare-warp/mdm.xml ] || [ -n "$REGISTER_WHEN_MDM_EXISTS" ]; then
-        warp-cli registration new && echo "Warp client registered!"
-        # if a license key is provided, register the license
-        if [ -n "$WARP_LICENSE_KEY" ]; then
-            echo "License key found, registering license..."
-            warp-cli registration license "$WARP_LICENSE_KEY" && echo "Warp license registered!"
+    echo "[WARP] Registering..."
+
+    if [ ! -f /var/lib/cloudflare-warp/mdm.xml ] || [ -n "${REGISTER_WHEN_MDM_EXISTS:-}" ]; then
+
+        warp-cli registration new
+
+        if [ -n "${WARP_LICENSE_KEY:-}" ]; then
+            echo "[WARP] Activating WARP+..."
+            warp-cli registration license "$WARP_LICENSE_KEY"
         fi
     fi
-    # connect to the warp server
-    warp-cli --accept-tos connect
 else
-    echo "Warp client already registered, skip registration"
+    echo "[WARP] Already registered."
 fi
 
-# disable qlog if DEBUG_ENABLE_QLOG is empty
-if [ -z "$DEBUG_ENABLE_QLOG" ]; then
-    warp-cli --accept-tos debug qlog disable
-else
+# Enable / Disable qlog
+if [ -n "${DEBUG_ENABLE_QLOG:-}" ]; then
     warp-cli --accept-tos debug qlog enable
+else
+    warp-cli --accept-tos debug qlog disable
 fi
 
-# if WARP_ENABLE_NAT is provided, enable NAT and forwarding
-if [ -n "$WARP_ENABLE_NAT" ]; then
-    # switch to warp mode
-    echo "[NAT] Switching to warp mode..."
+# Select mode
+if [ -n "${WARP_ENABLE_NAT:-}" ]; then
+    echo "[WARP] Switching to WARP mode..."
     warp-cli --accept-tos mode warp
-    warp-cli --accept-tos connect
-
-    # wait another seconds for the daemon to reconfigure
-    sleep "$WARP_SLEEP"
-
-    # enable NAT
-    echo "[NAT] Enabling NAT..."
-    sudo nft add table ip nat
-    sudo nft add chain ip nat WARP_NAT { type nat hook postrouting priority 100 \; }
-    sudo nft add rule ip nat WARP_NAT oifname "CloudflareWARP" masquerade
-    sudo nft add table ip mangle
-    sudo nft add chain ip mangle forward { type filter hook forward priority mangle \; }
-    sudo nft add rule ip mangle forward tcp flags syn tcp option maxseg size set rt mtu
-
-    sudo nft add table ip6 nat
-    sudo nft add chain ip6 nat WARP_NAT { type nat hook postrouting priority 100 \; }
-    sudo nft add rule ip6 nat WARP_NAT oifname "CloudflareWARP" masquerade
-    sudo nft add table ip6 mangle
-    sudo nft add chain ip6 mangle forward { type filter hook forward priority mangle \; }
-    sudo nft add rule ip6 mangle forward tcp flags syn tcp option maxseg size set rt mtu
+else
+    echo "[WARP] Switching to Proxy mode..."
+    warp-cli --accept-tos mode proxy
 fi
 
-# start the proxy
-gost $GOST_ARGS
+echo "[WARP] Connecting..."
+warp-cli --accept-tos connect
+
+sleep "${WARP_SLEEP:-2}"
+
+# Enable NAT
+if [ -n "${WARP_ENABLE_NAT:-}" ]; then
+
+    echo "[NAT] Configuring nftables..."
+
+    sudo nft list table ip nat >/dev/null 2>&1 || sudo nft add table ip nat
+
+    sudo nft list chain ip nat WARP_NAT >/dev/null 2>&1 || \
+        sudo nft add chain ip nat WARP_NAT "{ type nat hook postrouting priority 100; }"
+
+    sudo nft add rule ip nat WARP_NAT oifname "CloudflareWARP" masquerade 2>/dev/null || true
+
+    sudo nft list table ip6 nat >/dev/null 2>&1 || sudo nft add table ip6 nat
+
+    sudo nft list chain ip6 nat WARP_NAT >/dev/null 2>&1 || \
+        sudo nft add chain ip6 nat WARP_NAT "{ type nat hook postrouting priority 100; }"
+
+    sudo nft add rule ip6 nat WARP_NAT oifname "CloudflareWARP" masquerade 2>/dev/null || true
+fi
+
+echo "[Gost] Starting..."
+exec gost ${GOST_ARGS:--L :1080}
